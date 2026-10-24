@@ -85,11 +85,11 @@ pub(crate) enum OpKind {
     Chan(Box<OpKind>),
     Struct(Option<String>),
     Pointer(Box<OpKind>),
-    /// Function kind: result kinds, plus the declared parameter count when the
-    /// signature is known (`None` = unknown, e.g. a `fn`-typed value whose
-    /// declaration is out of reach). The count is what closes the
-    /// closure/method-value arity bypass (#577 C9).
-    Fn(Vec<OpKind>, Option<usize>),
+    /// Function kind: result kinds, parameter kinds, plus the declared
+    /// parameter count when known (`None` = unknown). The count is what closes
+    /// the closure/method-value arity bypass (#577 C9); parameter kinds let
+    /// expanded multi-value arguments be checked positionally (#1015).
+    Fn(Vec<OpKind>, Vec<OpKind>, Option<usize>),
     Void,
 }
 
@@ -127,10 +127,24 @@ impl OpKind {
 /// is allowed. `false` means "not provably a build failure", not "provably
 /// fine".
 ///
-/// NOTE: open PR #620 introduces this same helper for return-statement
-/// checking. Whichever of the two lands second should drop one copy — the two
-/// are textually identical on purpose.
 fn kinds_conflict(want: &OpKind, got: &OpKind) -> bool {
+    kinds_conflict_with_int_constant(want, got, true)
+}
+
+/// Kind comparison for values whose types are already fixed, such as the
+/// results of a call expanded into multiple arguments. Unlike an untyped int
+/// constant, a typed `int` value cannot be passed where `float64` is required.
+fn typed_kinds_conflict(want: &OpKind, got: &OpKind) -> bool {
+    kinds_conflict_with_int_constant(want, got, false)
+}
+
+/// Compare kinds while carrying whether the value may be an untyped integer
+/// constant through every nested container element.
+fn kinds_conflict_with_int_constant(
+    want: &OpKind,
+    got: &OpKind,
+    allow_int_constant_for_float: bool,
+) -> bool {
     use OpKind::*;
     match (want, got) {
         // Fail-open: an unresolved side carries no claim.
@@ -146,7 +160,11 @@ fn kinds_conflict(want: &OpKind, got: &OpKind) -> bool {
         // `Interface`, and `Interface` vs `Str` falls through to the mismatch
         // arm below, so every assignment to an `any` target would be rejected.
         // The accept-side corpus controls caught exactly that.
-        (Interface, _) | (_, Interface) => false,
+        //
+        // A typed `any` value (a call result) does not silently become a
+        // concrete type, though: `takes_int(pair_any())` needs an assertion.
+        (Interface, _) => false,
+        (_, Interface) => !allow_int_constant_for_float,
         // No value is involved; a count check owns that case.
         (Void, _) | (_, Void) => false,
         // An untyped int constant is assignable to a float target
@@ -157,19 +175,28 @@ fn kinds_conflict(want: &OpKind, got: &OpKind) -> bool {
         // (`fn f() float64 { return 1 }` builds). The kind model cannot tell
         // an untyped constant from an `int` variable, so this direction must
         // stay allowed or the check would reject buildable programs.
-        (Float, Int) => false,
+        (Float, Int) if allow_int_constant_for_float => false,
         // A struct whose name did not resolve is not evidence of a mismatch.
         (Struct(None), _) | (_, Struct(None)) => false,
         (a, b) if a == b => false,
         // Same container shape: recurse into the element kinds.
         (Slice(a), Slice(b)) | (Array(a), Array(b)) | (Chan(a), Chan(b)) => {
-            kinds_conflict(a, b)
+            kinds_conflict_with_int_constant(a, b, allow_int_constant_for_float)
         }
-        (Map(k1, v1), Map(k2, v2)) => kinds_conflict(k1, k2) || kinds_conflict(v1, v2),
-        (Pointer(a), Pointer(b)) => kinds_conflict(a, b),
-        // Fn kinds only carry results here, so a result match is not proof of
-        // a signature match; stay permissive.
-        (Fn(..), Fn(..)) => false,
+        (Map(k1, v1), Map(k2, v2)) => {
+            kinds_conflict_with_int_constant(k1, k2, allow_int_constant_for_float)
+                || kinds_conflict_with_int_constant(v1, v2, allow_int_constant_for_float)
+        }
+        (Pointer(a), Pointer(b)) => {
+            kinds_conflict_with_int_constant(a, b, allow_int_constant_for_float)
+        }
+        // Function signatures are checked at call sites, not when comparing
+        // function values as operands; stay permissive here. A typed value
+        // (the result of a call) is the exception: its signature is known, so
+        // a provably different callback signature is a real mismatch.
+        (Fn(..), Fn(..)) => {
+            !allow_int_constant_for_float && fn_signatures_conflict_with(want, got, true)
+        }
         // Everything else is a shape or scalar-family mismatch Go refuses.
         _ => true,
     }
@@ -212,6 +239,39 @@ fn is_definitely_single_value(e: &Expr) -> bool {
 /// in Go comparisons (`1 == 1.0` builds), so numeric families do not
 /// conflict. Across different families (e.g. numeric vs string/bool,
 /// pointer vs scalar), Go never permits comparison.
+/// Function kinds carry declared parameter kinds/arity when known. Comparing
+/// them by structural equality rejects a generic component that resolved to
+/// `Unknown`, while ignoring them entirely would accept an initializer whose
+/// known arity or result types visibly differ (`[1]fn(x int){two_param_fn}`).
+/// `true` means "provably incompatible"; unknown parts stay permissive.
+fn fn_signatures_conflict(a: &OpKind, b: &OpKind) -> bool {
+    fn_signatures_conflict_with(a, b, true)
+}
+
+/// `typed` selects the comparison rule for signature components: typed values
+/// (a call result) must not use the untyped numeric-constant allowance.
+fn fn_signatures_conflict_with(a: &OpKind, b: &OpKind, typed: bool) -> bool {
+    let (OpKind::Fn(a_res, a_params, a_arity), OpKind::Fn(b_res, b_params, b_arity)) = (a, b) else {
+        return false;
+    };
+    if a_params.len() != b_params.len() {
+        return true;
+    }
+    if let (Some(x), Some(y)) = (a_arity, b_arity) {
+        if x != y {
+            return true;
+        }
+    }
+    if a_res.len() != b_res.len() {
+        return true;
+    }
+    a_params
+        .iter()
+        .zip(b_params.iter())
+        .chain(a_res.iter().zip(b_res.iter()))
+        .any(|(x, y)| kinds_conflict_with_int_constant(x, y, !typed))
+}
+
 fn equality_kinds_conflict(a: &OpKind, b: &OpKind) -> bool {
     if a.is_numeric() && b.is_numeric() {
         return false;
@@ -1070,13 +1130,57 @@ impl<'a> Collector<'a> {
                 }
                 match unwrap_parens(callee) {
                     Expr::Ident { name, .. } => {
-                        self.check_user_fn_arity(name, args, *span);
-                        self.check_user_fn_arg_types(name, args);
+                        match self.lookup_kind(name) {
+                            Some(OpKind::Fn(_, param_kinds, arity)) => {
+                                if let Some(want) = arity {
+                                    let got =
+                                        self.multi_value_arg_count(args).unwrap_or(args.len());
+                                    if want != got {
+                                        self.report_local_arity(name, want, got, *span);
+                                    }
+                                }
+                                self.check_local_fn_arg_types(name, &param_kinds, args);
+                            }
+                            // A local non-function binding still shadows a
+                            // top-level function of the same name.
+                            Some(_) => {}
+                            None => {
+                                self.check_multi_value_arg_arity(callee, args, *span);
+                                self.check_user_fn_arity(name, args, *span);
+                                self.check_user_fn_arg_types(name, args);
+                            }
+                        }
                     }
                     Expr::Field { base, name, .. } => {
                         let bk = self.kind_of_expr(base);
-                        self.check_method_arity(&bk, name, args, *span);
-                        self.check_method_arg_types(&bk, name, args);
+                        let has_method = self
+                            .struct_base_name(&bk)
+                            .is_some_and(|sn| {
+                                self.ck.method_decls.contains_key(&(sn, name.clone()))
+                            });
+                        if has_method {
+                            self.check_method_arity(&bk, name, args, *span);
+                            self.check_method_arg_types(&bk, name, args);
+                        } else if let Some(OpKind::Fn(_, param_kinds, arity)) =
+                            self.struct_field_kind(&bk, name)
+                        {
+                            if let Some(want) = arity {
+                                let got = self.multi_value_arg_count(args).unwrap_or(args.len());
+                                if want != got {
+                                    self.report_local_arity(
+                                        &callee.render(),
+                                        want,
+                                        got,
+                                        *span,
+                                    );
+                                }
+                            }
+                            self.check_local_fn_arg_types(
+                                &callee.render(),
+                                &param_kinds,
+                                args,
+                            );
+                        }
                     }
                     _ => {}
                 }
@@ -1644,6 +1748,10 @@ impl<'a> Collector<'a> {
                     .iter()
                     .map(|r| self.kind_of_ty(r, depth + 1))
                     .collect(),
+                params
+                    .iter()
+                    .map(|p| self.kind_of_ty(&p.ty, depth + 1))
+                    .collect(),
                 Some(params.len()),
             ),
         }
@@ -1735,13 +1843,19 @@ impl<'a> Collector<'a> {
                 OpKind::Chan(Box::new(self.kind_of_ty_with_subst(elem, subst, depth + 1)))
             }
             TypeExpr::Option { .. } => OpKind::Unknown,
-            TypeExpr::Fn { results, .. } => OpKind::Fn(
+            TypeExpr::Fn {
+                params, results, ..
+            } => OpKind::Fn(
                 results
                     .iter()
                     .map(|r| self.kind_of_ty_with_subst(r, subst, depth + 1))
                     .collect(),
-                // A bare fn TYPE does not carry a call signature the kind model
-                // can trust a count from — keep the arity unknown.
+                params
+                    .iter()
+                    .map(|p| self.kind_of_ty_with_subst(&p.ty, subst, depth + 1))
+                    .collect(),
+                // Preserve this path's existing unknown-arity classification;
+                // the parameter kinds remain available for positional checks.
                 None,
             ),
         }
@@ -1830,6 +1944,10 @@ impl<'a> Collector<'a> {
                         f.results
                             .iter()
                             .map(|r| self.kind_of_ty(&r.ty, 0))
+                            .collect(),
+                        f.params
+                            .iter()
+                            .map(|p| self.kind_of_ty(&p.ty, 0))
                             .collect(),
                         Some(f.params.len()),
                     );
@@ -1962,6 +2080,10 @@ impl<'a> Collector<'a> {
                     .iter()
                     .map(|r| self.kind_of_ty(&r.ty, 0))
                     .collect(),
+                params
+                    .iter()
+                    .map(|p| self.kind_of_ty(&p.ty, 0))
+                    .collect(),
                 Some(params.len()),
             ),
             Expr::Call { callee, args, .. } => match self.call_result_kinds(callee, args) {
@@ -1990,7 +2112,7 @@ impl<'a> Collector<'a> {
             }
             Expr::Ident { name, .. } => {
                 if let Some(k) = self.lookup_kind(name) {
-                    if let OpKind::Fn(res, _) = k {
+                    if let OpKind::Fn(res, _, _) = k {
                         return Some(res);
                     }
                     return None;
@@ -2043,7 +2165,7 @@ impl<'a> Collector<'a> {
                         );
                     }
                 }
-                if let Some(OpKind::Fn(res, _)) = self.struct_field_kind(&bk, name) {
+                if let Some(OpKind::Fn(res, _, _)) = self.struct_field_kind(&bk, name) {
                     return Some(res);
                 }
                 None
@@ -2226,13 +2348,27 @@ impl<'a> Collector<'a> {
     fn non_single_value_count(&self, e: &Expr) -> Option<usize> {
         match unwrap_parens(e) {
             Expr::Call { callee, args, .. } => {
-                let res = self.call_result_kinds(callee, args)?;
+                let res = self.call_result_kinds_resolved(callee, args)?;
                 if res.len() == 1 {
                     None
                 } else {
                     Some(res.len())
                 }
             }
+            _ => None,
+        }
+    }
+
+    /// Result kinds of a call, falling back to the callee's resolved function
+    /// kind when `call_result_kinds` cannot see it — an indexed or higher-order
+    /// callee such as `fns[0]()` still expands to its declared results.
+    fn call_result_kinds_resolved(&self, callee: &Expr, args: &[CallArg]) -> Option<Vec<OpKind>> {
+        if let Some(res) = self.call_result_kinds(callee, args) {
+            return Some(res);
+        }
+        match self.kind_of_expr(callee) {
+            OpKind::Fn(results, _, _) => Some(results),
+            OpKind::Void => Some(Vec::new()),
             _ => None,
         }
     }
@@ -2290,7 +2426,6 @@ impl<'a> Collector<'a> {
         }
     }
 
-
     /// #1015 — result kinds of a lone multi-value call used as the whole
     /// argument list, in positional order. `None` when the argument list is not
     /// exactly one multi-value call.
@@ -2300,7 +2435,7 @@ impl<'a> Collector<'a> {
         }
         match unwrap_parens(&args[0].value) {
             Expr::Call { callee, args: inner, .. } => {
-                let res = self.call_result_kinds(callee, inner)?;
+                let res = self.call_result_kinds_resolved(callee, inner)?;
                 if res.len() >= 2 {
                     Some(res)
                 } else {
@@ -2308,6 +2443,43 @@ impl<'a> Collector<'a> {
                 }
             }
             _ => None,
+        }
+    }
+
+    /// #1015 — check positional kinds for a lone multi-value argument passed
+    /// to a local function value or function-typed field.
+    fn check_local_fn_arg_types(
+        &mut self,
+        callee: &str,
+        param_kinds: &[OpKind],
+        args: &[CallArg],
+    ) {
+        let Some(results) = self.multi_value_arg_kinds(args) else {
+            return;
+        };
+        if results.len() != param_kinds.len() {
+            return;
+        }
+        let Some(arg) = args.first() else {
+            return;
+        };
+        let span = arg.value.span();
+        let rendered = arg.value.render();
+        for (want, got) in param_kinds.iter().zip(results.iter()) {
+            if typed_kinds_conflict(want, got) {
+                self.emit_e1002(
+                    span,
+                    format!(
+                        "cannot use `{}` (value of type `{}`) as `{}` value in argument to `{}` — Go refuses mismatched argument types (HYB-E1002)",
+                        rendered,
+                        got.label(),
+                        want.label(),
+                        callee
+                    ),
+                    "argument types must match declared parameter types",
+                );
+                break;
+            }
         }
     }
 
@@ -2481,7 +2653,7 @@ impl<'a> Collector<'a> {
                 let span = args[0].value.span();
                 let rendered = args[0].value.render();
                 for (want, got) in param_kinds.iter().zip(results.iter()) {
-                    if kinds_conflict(want, got) {
+                    if typed_kinds_conflict(want, got) {
                         self.emit_e1002(
                             span,
                             format!(
@@ -2545,7 +2717,7 @@ impl<'a> Collector<'a> {
                 let span = args[0].value.span();
                 let rendered = args[0].value.render();
                 for (want, got) in param_kinds.iter().zip(results.iter()) {
-                    if kinds_conflict(want, got) {
+                    if typed_kinds_conflict(want, got) {
                         self.emit_e1002(
                             span,
                             format!(
@@ -2718,6 +2890,11 @@ impl<'a> Collector<'a> {
         let Expr::Ident { name, .. } = unwrap_parens(callee) else {
             return;
         };
+        // A local binding shadows any top-level function of the same name; the
+        // local `OpKind::Fn` arity/type checks own that call (#1015).
+        if matches!(self.lookup_kind(name), Some(OpKind::Fn(..))) {
+            return;
+        }
         let head = Checker::base_named_type_str(name);
         let Some(f) = self.ck.fns.get(name).or_else(|| self.ck.fns.get(head)) else {
             return;
@@ -3655,6 +3832,12 @@ impl<'a> Collector<'a> {
             if ik == OpKind::Unknown || ik == expected {
                 continue;
             }
+            if matches!(ik, OpKind::Fn(..))
+                && matches!(expected, OpKind::Fn(..))
+                && !fn_signatures_conflict(&expected, &ik)
+            {
+                continue;
+            }
             if expected == OpKind::Float
                 && ik == OpKind::Int
                 && crate::const_overflow::const_int_value(item).is_some()
@@ -3714,6 +3897,12 @@ impl<'a> Collector<'a> {
             }
             let ik = self.kind_of_expr(item);
             if ik == OpKind::Unknown || ik == expected {
+                continue;
+            }
+            if matches!(ik, OpKind::Fn(..))
+                && matches!(expected, OpKind::Fn(..))
+                && !fn_signatures_conflict(&expected, &ik)
+            {
                 continue;
             }
             if expected == OpKind::Float
@@ -3891,19 +4080,23 @@ impl<'a> Collector<'a> {
             }
             Expr::Ident { name, .. } => {
                 if let Some(k) = self.lookup_kind(name) {
-                    match k {
+                    match &k {
                         // A local bound to a closure or fn-typed value carries
                         // its declared parameter count, so the call's arity is
                         // checkable (#577 C9).
                         // #1015: a lone multi-value call expands to one
                         // argument per result, so it is not "1 argument".
-                        OpKind::Fn(_, Some(want))
-                            if want != self.multi_value_arg_count(args).unwrap_or(args.len()) =>
-                        {
-                            let call_got = self.multi_value_arg_count(args).unwrap_or(args.len());
-                            self.report_local_arity(name, want, call_got, span)
+                        OpKind::Fn(_, param_kinds, arity) => {
+                            if let Some(want) = arity {
+                                let call_got =
+                                    self.multi_value_arg_count(args).unwrap_or(args.len());
+                                if *want != call_got {
+                                    self.report_local_arity(name, *want, call_got, span);
+                                }
+                            }
+                            self.check_local_fn_arg_types(name, param_kinds, args);
                         }
-                        OpKind::Fn(..) | OpKind::Unknown => {}
+                        OpKind::Unknown => {}
                         _ => self.emit_e1002(
                             span,
                             format!(
@@ -3977,12 +4170,21 @@ impl<'a> Collector<'a> {
                     // `u.cb(1, 2)` where `cb fn(x int) int` — the field type
                     // states the count.
                     if !has_method {
-                        if let OpKind::Fn(_, Some(want)) = fk {
-                            // #1015: same multi-value expansion rule as above.
-                            let call_got = self.multi_value_arg_count(args).unwrap_or(args.len());
-                            if want != call_got {
-                                self.report_local_arity(&callee.render(), want, call_got, span);
+                        if let OpKind::Fn(_, param_kinds, arity) = &fk {
+                            if let Some(want) = arity {
+                                // #1015: same multi-value expansion rule as above.
+                                let call_got =
+                                    self.multi_value_arg_count(args).unwrap_or(args.len());
+                                if *want != call_got {
+                                    self.report_local_arity(
+                                        &callee.render(),
+                                        *want,
+                                        call_got,
+                                        span,
+                                    );
+                                }
                             }
+                            self.check_local_fn_arg_types(&callee.render(), param_kinds, args);
                         }
                     }
                 } else if name == "pop" {

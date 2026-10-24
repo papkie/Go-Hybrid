@@ -519,30 +519,78 @@ fn named_results_on_plain_fn() {
 }
 
 #[test]
-fn mixed_results_on_plain_fn_are_uniformly_named() {
+fn mixed_results_on_plain_fn_use_blank_names_for_unnamed_results() {
     let go = emit("fn f() (code int, string) {\n    return 3, \"ok\"\n}\n");
     assert!(
-        go.contains("func f() (code int, hyR1 string) {"),
+        go.contains("func f() (code int, _ string) {"),
         "named-then-unnamed results must remain buildable:\n{}",
         go
     );
 
     let go = emit("fn f() (int, text string) {\n    return 3, \"ok\"\n}\n");
     assert!(
-        go.contains("func f() (hyR0 int, text string) {"),
+        go.contains("func f() (_ int, text string) {"),
         "unnamed-then-named results must retain their types:\n{}",
         go
     );
 }
 
 #[test]
-fn mixed_results_on_fn_literal_are_uniformly_named() {
+fn mixed_results_on_fn_literal_use_blank_names_for_unnamed_results() {
     let go = emit(
         "fn main() {\n    f := fn() (code int, string) {\n        return 3, \"ok\"\n    }\n}\n",
     );
     assert!(
-        go.contains("func() (code int, hyR1 string) {"),
+        go.contains("func() (code int, _ string) {"),
         "function literals use the same Go result-list rules:\n{}",
+        go
+    );
+}
+
+#[test]
+fn mixed_result_parameter_is_not_shadowed_by_result_name() {
+    let go = emit(
+        "fn f(hy_r1 int) (code int, string) {\n    return hy_r1, \"ok\"\n}\n",
+    );
+    let signature = go
+        .lines()
+        .find(|line| line.starts_with("func f("))
+        .expect("emitted function signature");
+    assert!(
+        signature.starts_with("func f(hy_r1 int)"),
+        "the parameter must not be renamed:\n{}",
+        signature
+    );
+    assert!(
+        signature.contains("func f(hy_r1 int) (code int, _ string) {"),
+        "unnamed mixed result must use the blank identifier:\n{}",
+        signature
+    );
+    assert!(
+        !signature.contains("hyR0") && !signature.contains("hyR1"),
+        "synthesized result names must not appear in the signature:\n{}",
+        signature
+    );
+}
+
+#[test]
+fn mixed_result_fn_literal_does_not_shadow_outer_binding() {
+    let go = emit(
+        "fn main() {\n    hy_r1 := 7\n    outer := fn() {\n        inner := fn() (code int, string) {\n            return hy_r1, \"ok\"\n        }\n        fmt.println(inner())\n    }\n    outer()\n}\n",
+    );
+    assert!(
+        go.contains("func() (code int, _ string) {"),
+        "mixed-result literal must use the blank identifier:\n{}",
+        go
+    );
+    assert!(
+        go.contains("return hy_r1, \"ok\""),
+        "the literal body must keep referring to the outer binding:\n{}",
+        go
+    );
+    assert!(
+        !go.contains("func() (code int, hy_r1 string) {"),
+        "the literal signature must not shadow the outer binding:\n{}",
         go
     );
 }
